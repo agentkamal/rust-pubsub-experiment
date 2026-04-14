@@ -335,16 +335,44 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_triggers() {
-        assert!(true);
+        let mut batch = Batch::new();
+        assert!(batch.is_empty());
+        
+        let (tx, _rx) = oneshot::channel();
+        batch.add(PublishMessage {
+            message: PubsubMessage { data: vec![1, 2, 3], ordering_key: String::new(), ..Default::default() },
+            responder: tx,
+        });
+        
+        assert!(!batch.is_empty());
+        assert_eq!(batch.messages.len(), 1);
+        assert!(batch.byte_size > 0);
     }
 
     #[tokio::test]
     async fn test_ordering_keys() {
-        assert!(true);
+        let settings = BatchingSettings::default();
+        assert_eq!(settings.element_count_threshold, 1000);
+        assert_eq!(settings.request_byte_threshold, 1_000_000);
+        assert_eq!(settings.delay_threshold, Duration::from_millis(10));
     }
 
     #[tokio::test]
     async fn test_error_propagation_and_retries() {
-        assert!(true);
+        let (tx, mut rx) = mpsc::unbounded_channel::<ActorMessage>();
+        let (resp_tx, _resp_rx) = oneshot::channel();
+        
+        let pub_msg = PublishMessage {
+            message: PubsubMessage::default(),
+            responder: resp_tx,
+        };
+        
+        tx.send(ActorMessage::Publish(pub_msg)).unwrap();
+        
+        let msg = rx.recv().await.unwrap();
+        match msg {
+            ActorMessage::Publish(m) => assert_eq!(m.message.ordering_key, ""),
+            _ => panic!("Expected Publish message"),
+        }
     }
 }

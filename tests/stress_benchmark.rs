@@ -164,12 +164,14 @@ async fn benchmark_publisher_1m_msgs_10k_clients() {
     let total_msgs = 1_000_000;
     let msgs_per_task = total_msgs / 10000;
 
-    for _ in 0..10000 {
+    for i in 0..10000 {
         let pub_clone = publisher.clone();
+        let ordering_key = if i % 2 == 0 { format!("key-{}", i % 100) } else { String::new() };
         handles.push(tokio::spawn(async move {
             for _ in 0..msgs_per_task {
                 let msg = PubsubMessage {
                     data: vec![0; 1024],
+                    ordering_key: ordering_key.clone(),
                     ..Default::default()
                 };
                 let _ = pub_clone.publish(msg).await;

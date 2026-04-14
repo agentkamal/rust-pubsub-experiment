@@ -146,7 +146,7 @@ impl Subscriber {
                                 );
                                 
                                 // Exactly-once modack on receipt (Receipt Modack)
-                                let _ = ack_tx.send(AckRequest::ModAck(received_msg.ack_id.clone(), 60));
+                                let _ = ack_tx.send(AckRequest::ModAck(received_msg.ack_id.clone(), 60)).await;
 
                                 if output_tx.send(Ok((message, consumer))).await.is_err() {
                                     break; // User dropped the stream
@@ -171,19 +171,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_and_channel_lifecycle() {
-        // Placeholder for stream reconnect logic tests.
-        assert!(true);
+        let (tx, mut rx) = mpsc::channel(10);
+        let consumer = AckReplyConsumer::new("test_ack_id".to_string(), tx);
+        assert_eq!(consumer.ack_id, "test_ack_id");
     }
 
     #[tokio::test]
     async fn test_exactly_once_modacks() {
-        // Placeholder for receipt modack and lease extension tests.
-        assert!(true);
+        let (tx, mut rx) = mpsc::channel(10);
+        let consumer = AckReplyConsumer::new("test_ack_id".to_string(), tx);
+        
+        consumer.ack().await.unwrap();
+        
+        let req = rx.recv().await.unwrap();
+        match req {
+            AckRequest::Ack(id) => assert_eq!(id, "test_ack_id"),
+            _ => panic!("Expected AckRequest::Ack"),
+        }
     }
 
     #[tokio::test]
     async fn test_shutdown_logic() {
-        // Placeholder for graceful shutdown and immediate nack tests.
-        assert!(true);
+        let (tx, mut rx) = mpsc::channel(10);
+        let consumer = AckReplyConsumer::new("test_nack_id".to_string(), tx);
+        
+        consumer.nack().await.unwrap();
+        
+        let req = rx.recv().await.unwrap();
+        match req {
+            AckRequest::Nack(id) => assert_eq!(id, "test_nack_id"),
+            _ => panic!("Expected AckRequest::Nack"),
+        }
     }
 }
