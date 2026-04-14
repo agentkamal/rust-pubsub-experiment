@@ -1,0 +1,20 @@
+[package]
+name = "rust-pubsub"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.37", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync", "net"] }
+tonic = { version = "0.11", features = ["tls", "tls-webpki-roots"] }
+prost = "0.12"
+prost-types = "0.12"
+thiserror = "1.0"
+futures = "0.3"
+async-stream = "0.3.6"
+fastrand = "2.4.1"
+
+[build-dependencies]
+prost-build = "0.12"
+protoc-bin-vendored = "3.2.0"
+tonic-build = "0.11"
