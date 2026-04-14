@@ -1,8 +1,8 @@
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use crate::error::Result;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use crate::error::Result;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 const PUBSUB_ENDPOINT: &str = "https://pubsub.googleapis.com";
 
@@ -16,9 +16,10 @@ impl Connection {
         let endpoint_str = endpoint.unwrap_or(PUBSUB_ENDPOINT);
         let endpoint = Endpoint::from_str(endpoint_str)
             .map_err(|e| crate::error::Error::Connection(e.to_string()))?;
-        
+
         let endpoint = if endpoint_str.starts_with("https") {
-            endpoint.tls_config(ClientTlsConfig::new())
+            endpoint
+                .tls_config(ClientTlsConfig::new())
                 .map_err(|e| crate::error::Error::Connection(e.to_string()))?
         } else {
             endpoint

@@ -38,10 +38,7 @@ impl SchemaAdminClient {
         Ok(())
     }
 
-    pub fn list_schemas(
-        &self,
-        parent: impl Into<String>,
-    ) -> impl Stream<Item = Result<Schema>> {
+    pub fn list_schemas(&self, parent: impl Into<String>) -> impl Stream<Item = Result<Schema>> {
         let mut client = self.client.clone();
         let parent = parent.into();
 
@@ -55,11 +52,11 @@ impl SchemaAdminClient {
                     page_token: page_token.clone(),
                 };
                 let response = client.list_schemas(request).await.map_err(Error::Grpc)?.into_inner();
-                
+
                 for schema in response.schemas {
                     yield schema;
                 }
-                
+
                 page_token = response.next_page_token;
                 if page_token.is_empty() {
                     break;

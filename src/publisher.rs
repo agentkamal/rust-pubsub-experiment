@@ -1,7 +1,8 @@
 use crate::error::{Error, Result};
 use crate::models::{publisher_client::PublisherClient, PublishRequest, PubsubMessage};
-use std::collections::HashMap;
+use prost::Message;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -9,7 +10,6 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::interval;
 use tonic::transport::Channel;
-use prost::Message;
 
 #[derive(Clone, Debug)]
 pub struct BatchingSettings {
@@ -44,10 +44,7 @@ struct PublishMessage {
 enum ActorMessage {
     Publish(PublishMessage),
     ResumePublish(String),
-    BatchCompletion {
-        key: String,
-        success: bool,
-    },
+    BatchCompletion { key: String, success: bool },
 }
 
 struct Batch {
@@ -77,7 +74,11 @@ impl Batch {
 }
 
 impl Publisher {
-    pub fn new(topic: String, pool: crate::connection::ConnectionPool, settings: BatchingSettings) -> Self {
+    pub fn new(
+        topic: String,
+        pool: crate::connection::ConnectionPool,
+        settings: BatchingSettings,
+    ) -> Self {
         let num_shards = 16;
         let mut senders = Vec::with_capacity(num_shards);
         let inflight_limit = Arc::new(Semaphore::new(100));
@@ -87,9 +88,11 @@ impl Publisher {
         // under severe network partitions, this could lead to OOM errors if messages queue indefinitely.
         for _ in 0..num_shards {
             let (tx, rx) = mpsc::unbounded_channel();
-            
-            let client = PublisherClient::new(pool.get_channel());
-            
+
+            let client = PublisherClient::new(pool.get_channel())
+                .max_decoding_message_size(20 * 1024 * 1024)
+                .max_encoding_message_size(20 * 1024 * 1024);
+
             let actor = PublisherActor {
                 topic: topic.clone(),
                 client,
@@ -102,13 +105,13 @@ impl Publisher {
                 actor_tx: tx.clone(),
                 inflight_rpc_limit: inflight_limit.clone(),
             };
-            
+
             tokio::spawn(actor.run());
             senders.push(tx);
         }
 
-        Self { 
-            topic, 
+        Self {
+            topic,
             senders,
             next_shard: AtomicUsize::new(0),
         }
@@ -117,7 +120,7 @@ impl Publisher {
     pub async fn publish(&self, message: PubsubMessage) -> Result<String> {
         let (tx, rx) = oneshot::channel();
         let key = message.ordering_key.clone();
-        
+
         let shard_idx = if !key.is_empty() {
             let mut hasher = DefaultHasher::new();
             key.hash(&mut hasher);
@@ -130,11 +133,12 @@ impl Publisher {
             message,
             responder: tx,
         };
-self.senders[shard_idx]
-    .send(ActorMessage::Publish(pub_msg))
-    .map_err(|_| Error::Internal("Publisher closed".to_string()))?;
+        self.senders[shard_idx]
+            .send(ActorMessage::Publish(pub_msg))
+            .map_err(|_| Error::Internal("Publisher closed".to_string()))?;
 
-        rx.await.unwrap_or_else(|_| Err(Error::Internal("Publisher task died".to_string())))
+        rx.await
+            .unwrap_or_else(|_| Err(Error::Internal("Publisher task died".to_string())))
     }
 
     pub async fn resume_publish(&self, ordering_key: String) -> Result<()> {
@@ -161,10 +165,10 @@ struct PublisherActor {
     client: PublisherClient<Channel>,
     settings: BatchingSettings,
     receiver: mpsc::UnboundedReceiver<ActorMessage>,
-    
+
     // Empty ordering key
     unordered_batch: Batch,
-    
+
     // Key -> Batch
     ordered_batches: HashMap<String, Batch>,
     // Key -> Is currently inflight
@@ -206,21 +210,32 @@ impl PublisherActor {
         }
     }
 
-    async fn handle_message(&mut self, msg: ActorMessage, flush_tx: &mpsc::UnboundedSender<(Option<String>, Batch)>) {
+    async fn handle_message(
+        &mut self,
+        msg: ActorMessage,
+        flush_tx: &mpsc::UnboundedSender<(Option<String>, Batch)>,
+    ) {
         match msg {
             ActorMessage::Publish(msg) => {
                 let key = msg.message.ordering_key.clone();
-                
+
                 if !key.is_empty() {
                     if self.ordered_failed.get(&key).copied().unwrap_or(false) {
-                        let _ = msg.responder.send(Err(Error::Internal("Ordering key failed".into())));
+                        let _ = msg
+                            .responder
+                            .send(Err(Error::Internal("Ordering key failed".into())));
                         return;
                     }
-                    
-                    let batch = self.ordered_batches.entry(key.clone()).or_insert_with(Batch::new);
+
+                    let batch = self
+                        .ordered_batches
+                        .entry(key.clone())
+                        .or_insert_with(Batch::new);
                     batch.add(msg);
-                    
-                    if batch.messages.len() >= self.settings.element_count_threshold || batch.byte_size >= self.settings.request_byte_threshold {
+
+                    if batch.messages.len() >= self.settings.element_count_threshold
+                        || batch.byte_size >= self.settings.request_byte_threshold
+                    {
                         if !self.ordered_inflight.get(&key).copied().unwrap_or(false) {
                             let full_batch = std::mem::replace(batch, Batch::new());
                             self.ordered_inflight.insert(key.clone(), true);
@@ -229,7 +244,9 @@ impl PublisherActor {
                     }
                 } else {
                     self.unordered_batch.add(msg);
-                    if self.unordered_batch.messages.len() >= self.settings.element_count_threshold || self.unordered_batch.byte_size >= self.settings.request_byte_threshold {
+                    if self.unordered_batch.messages.len() >= self.settings.element_count_threshold
+                        || self.unordered_batch.byte_size >= self.settings.request_byte_threshold
+                    {
                         let full_batch = std::mem::replace(&mut self.unordered_batch, Batch::new());
                         let _ = flush_tx.send((None, full_batch));
                     }
@@ -239,7 +256,9 @@ impl PublisherActor {
                 self.ordered_failed.insert(key.clone(), false);
                 // Also could flush pending messages here
                 if let Some(batch) = self.ordered_batches.get_mut(&key) {
-                    if !batch.is_empty() && !self.ordered_inflight.get(&key).copied().unwrap_or(false) {
+                    if !batch.is_empty()
+                        && !self.ordered_inflight.get(&key).copied().unwrap_or(false)
+                    {
                         let full_batch = std::mem::replace(batch, Batch::new());
                         self.ordered_inflight.insert(key.clone(), true);
                         let _ = flush_tx.send((Some(key), full_batch));
@@ -253,7 +272,8 @@ impl PublisherActor {
                     // Fail pending messages
                     if let Some(mut batch) = self.ordered_batches.remove(&key) {
                         for responder in batch.responders.drain(..) {
-                            let _ = responder.send(Err(Error::Internal("Ordering key failed".into())));
+                            let _ =
+                                responder.send(Err(Error::Internal("Ordering key failed".into())));
                         }
                     }
                 } else {
@@ -303,9 +323,34 @@ impl PublisherActor {
 
         tokio::spawn(async move {
             let _permit = limit.acquire_owned().await;
-            let res = client.publish(req).await;
+
+            let mut attempt = 0;
+            let mut backoff = Duration::from_millis(100);
+
+            let res = loop {
+                let req_clone = PublishRequest {
+                    topic: req.topic.clone(),
+                    messages: req.messages.clone(),
+                };
+                match client.publish(req_clone).await {
+                    Ok(r) => break Ok(r),
+                    Err(e) => {
+                        if (e.code() == tonic::Code::Unavailable
+                            || e.code() == tonic::Code::ResourceExhausted)
+                            && attempt < 5
+                        {
+                            attempt += 1;
+                            tokio::time::sleep(backoff).await;
+                            backoff *= 2;
+                        } else {
+                            break Err(e);
+                        }
+                    }
+                }
+            };
+
             drop(_permit);
-            
+
             let success = match res {
                 Ok(response) => {
                     let message_ids = response.into_inner().message_ids;
@@ -321,7 +366,7 @@ impl PublisherActor {
                     false
                 }
             };
-            
+
             if let Some(k) = key {
                 let _ = actor_tx.send(ActorMessage::BatchCompletion { key: k, success });
             }
@@ -337,20 +382,24 @@ mod tests {
     async fn test_batch_triggers() {
         let mut batch = Batch::new();
         assert!(batch.is_empty());
-        
+
         let (tx, _rx) = oneshot::channel();
         batch.add(PublishMessage {
-            message: PubsubMessage { data: vec![1, 2, 3], ordering_key: String::new(), ..Default::default() },
+            message: PubsubMessage {
+                data: vec![1, 2, 3],
+                ordering_key: String::new(),
+                ..Default::default()
+            },
             responder: tx,
         });
-        
+
         assert!(!batch.is_empty());
         assert_eq!(batch.messages.len(), 1);
         assert!(batch.byte_size > 0);
     }
 
     #[tokio::test]
-    async fn test_ordering_keys() {
+    async fn test_default_batching_settings() {
         let settings = BatchingSettings::default();
         assert_eq!(settings.element_count_threshold, 1000);
         assert_eq!(settings.request_byte_threshold, 1_000_000);
@@ -361,14 +410,14 @@ mod tests {
     async fn test_error_propagation_and_retries() {
         let (tx, mut rx) = mpsc::unbounded_channel::<ActorMessage>();
         let (resp_tx, _resp_rx) = oneshot::channel();
-        
+
         let pub_msg = PublishMessage {
             message: PubsubMessage::default(),
             responder: resp_tx,
         };
-        
+
         tx.send(ActorMessage::Publish(pub_msg)).unwrap();
-        
+
         let msg = rx.recv().await.unwrap();
         match msg {
             ActorMessage::Publish(m) => assert_eq!(m.message.ordering_key, ""),

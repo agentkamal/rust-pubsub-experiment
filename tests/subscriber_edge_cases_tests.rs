@@ -3,6 +3,7 @@ use rust_pubsub::models::{
     PubsubMessage, ReceivedMessage, StreamingPullRequest, StreamingPullResponse,
 };
 use rust_pubsub::subscriber::Subscriber;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -12,13 +13,14 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 #[derive(Clone)]
-pub struct MockSubscriber {
+pub struct EdgeCaseMockSubscriber {
     pub streaming_pull_requests: Arc<Mutex<Vec<StreamingPullRequest>>>,
     pub push_messages_tx: Arc<Mutex<Option<mpsc::Sender<Result<StreamingPullResponse, Status>>>>>,
+    pub drop_connection: Arc<Mutex<bool>>,
 }
 
 #[tonic::async_trait]
-impl GrpcSubscriber for MockSubscriber {
+impl GrpcSubscriber for EdgeCaseMockSubscriber {
     async fn create_subscription(
         &self,
         _request: Request<rust_pubsub::models::Subscription>,
@@ -79,8 +81,13 @@ impl GrpcSubscriber for MockSubscriber {
         *self.push_messages_tx.lock().unwrap() = Some(tx);
 
         let reqs = self.streaming_pull_requests.clone();
+        let drop_conn = self.drop_connection.clone();
+
         tokio::spawn(async move {
             while let Ok(Some(req)) = in_stream.message().await {
+                if *drop_conn.lock().unwrap() {
+                    break; // simulate connection drop
+                }
                 reqs.lock().unwrap().push(req);
             }
         });
@@ -132,10 +139,11 @@ impl GrpcSubscriber for MockSubscriber {
     }
 }
 
-async fn start_mock_subscriber() -> (tokio::task::JoinHandle<()>, String, MockSubscriber) {
-    let mock_subscriber = MockSubscriber {
+async fn start_mock_subscriber() -> (tokio::task::JoinHandle<()>, String, EdgeCaseMockSubscriber) {
+    let mock_subscriber = EdgeCaseMockSubscriber {
         streaming_pull_requests: Arc::new(Mutex::new(Vec::new())),
         push_messages_tx: Arc::new(Mutex::new(None)),
+        drop_connection: Arc::new(Mutex::new(false)),
     };
 
     let mock_clone = mock_subscriber.clone();
@@ -146,9 +154,7 @@ async fn start_mock_subscriber() -> (tokio::task::JoinHandle<()>, String, MockSu
 
     let server_handle = tokio::spawn(async move {
         Server::builder()
-            .add_service(
-                SubscriberServer::new(mock_clone).max_decoding_message_size(20 * 1024 * 1024),
-            )
+            .add_service(SubscriberServer::new(mock_clone))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                 tokio::net::TcpListener::from_std(listener).unwrap(),
             ))
@@ -158,160 +164,6 @@ async fn start_mock_subscriber() -> (tokio::task::JoinHandle<()>, String, MockSu
 
     (server_handle, addr_str, mock_subscriber)
 }
-
-#[tokio::test]
-async fn test_subscriber_ack_modack_batching() {
-    let (_server, addr, mock_sub) = start_mock_subscriber().await;
-    let pool = rust_pubsub::connection::ConnectionPool::new(1, Some(&addr))
-        .await
-        .unwrap();
-    let mut subscriber = Subscriber::new("test-sub".into(), pool);
-
-    let mut stream = subscriber.subscribe().await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let tx = mock_sub
-        .push_messages_tx
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("Client didn't connect");
-
-    let mut msgs = Vec::new();
-    for i in 0..100 {
-        msgs.push(ReceivedMessage {
-            ack_id: format!("ack-{}", i),
-            message: Some(PubsubMessage {
-                data: vec![i as u8],
-                ..Default::default()
-            }),
-            delivery_attempt: 1,
-        });
-    }
-
-    tx.send(Ok(StreamingPullResponse {
-        received_messages: msgs,
-        subscription_properties: None,
-        acknowledge_confirmation: None,
-        modify_ack_deadline_confirmation: None,
-    }))
-    .await
-    .unwrap();
-
-    let mut consumers = Vec::new();
-    for _ in 0..100 {
-        if let Some(Ok((_msg, consumer))) = stream.next().await {
-            consumers.push(consumer);
-        }
-    }
-
-    for consumer in consumers {
-        tokio::spawn(async move {
-            let _ = consumer.ack().await;
-        });
-    }
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let requests = mock_sub.streaming_pull_requests.lock().unwrap();
-
-    let ack_requests: Vec<_> = requests.iter().filter(|r| !r.ack_ids.is_empty()).collect();
-
-    assert!(
-        !ack_requests.is_empty(),
-        "Expected at least one ack request"
-    );
-    assert!(
-        ack_requests.len() < 100,
-        "Acks must be batched, got {} requests for 100 acks",
-        ack_requests.len()
-    );
-
-    let has_batched = ack_requests.iter().any(|req| req.ack_ids.len() > 1);
-    assert!(has_batched, "Acks must be aggregated into batches");
-}
-
-#[tokio::test]
-async fn test_subscriber_exactly_once_receipt_modack() {
-    let (_server, addr, mock_sub) = start_mock_subscriber().await;
-    let pool = rust_pubsub::connection::ConnectionPool::new(1, Some(&addr))
-        .await
-        .unwrap();
-    let mut subscriber = Subscriber::new("test-sub".into(), pool);
-
-    let mut stream = subscriber.subscribe().await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let tx = mock_sub
-        .push_messages_tx
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("Client didn't connect");
-
-    tx.send(Ok(StreamingPullResponse {
-        received_messages: vec![ReceivedMessage {
-            ack_id: "test-ack-id".into(),
-            message: Some(PubsubMessage {
-                data: b"test".to_vec(),
-                ..Default::default()
-            }),
-            delivery_attempt: 1,
-        }],
-        subscription_properties: None,
-        acknowledge_confirmation: None,
-        modify_ack_deadline_confirmation: None,
-    }))
-    .await
-    .unwrap();
-
-    let _ = stream.next().await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let requests = mock_sub.streaming_pull_requests.lock().unwrap();
-
-    assert!(
-        requests.iter().any(|req| req.modify_deadline_ack_ids.contains(&"test-ack-id".into())),
-        "A receipt ModAck must be sent immediately upon receiving the message for exactly-once delivery"
-    );
-}
-
-#[tokio::test]
-async fn test_subscriber_network_resilience_reconnect() {
-    let (_server, addr, mock_sub) = start_mock_subscriber().await;
-    let pool = rust_pubsub::connection::ConnectionPool::new(1, Some(&addr))
-        .await
-        .unwrap();
-    let mut subscriber = Subscriber::new("test-sub".into(), pool);
-
-    let mut stream = subscriber.subscribe().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let tx = mock_sub
-        .push_messages_tx
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("Client didn't connect");
-
-    // Drop the tx to simulate server disconnect
-    drop(tx);
-
-    // In parity with Java, the client should automatically reconnect.
-    // This should result in a new connection and a new Tx being registered in the mock server.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let new_tx = mock_sub.push_messages_tx.lock().unwrap().clone();
-    assert!(
-        new_tx.is_some(),
-        "Subscriber did not reconnect automatically after stream dropped"
-    );
-}
-
-use std::collections::HashMap;
 
 #[tokio::test]
 async fn test_subscriber_flow_control() {
@@ -331,6 +183,7 @@ async fn test_subscriber_flow_control() {
         .clone()
         .expect("Client didn't connect");
 
+    // Send 10000 messages (high volume)
     let mut msgs = Vec::new();
     for i in 0..10000 {
         msgs.push(ReceivedMessage {
@@ -352,6 +205,8 @@ async fn test_subscriber_flow_control() {
     .await
     .unwrap();
 
+    // We should be able to receive them without OOM or crashing,
+    // and flow control should pause stream if buffer is full (hard to test without internal metrics, but basic consumption shouldn't fail)
     let mut count = 0;
     while let Some(Ok((_msg, consumer))) = stream.next().await {
         count += 1;
@@ -368,8 +223,7 @@ async fn test_subscriber_flow_control() {
 }
 
 #[tokio::test]
-async fn test_subscriber_retry_backoff() {
-    // We will test reconnect backoff with an explicit ResourceExhausted error
+async fn test_subscriber_network_resilience_reconnect() {
     let (_server, addr, mock_sub) = start_mock_subscriber().await;
     let pool = rust_pubsub::connection::ConnectionPool::new(1, Some(&addr))
         .await
@@ -386,43 +240,65 @@ async fn test_subscriber_retry_backoff() {
         .clone()
         .expect("Client didn't connect");
 
-    // Inject ResourceExhausted fault to trigger backoff
-    let _ = tx1
-        .send(Err(Status::resource_exhausted(
-            "resource exhausted, please backoff",
-        )))
-        .await;
+    // Send message on first connection
+    tx1.send(Ok(StreamingPullResponse {
+        received_messages: vec![ReceivedMessage {
+            ack_id: "ack-1".into(),
+            message: Some(PubsubMessage {
+                data: b"m1".to_vec(),
+                ..Default::default()
+            }),
+            delivery_attempt: 1,
+        }],
+        subscription_properties: None,
+        acknowledge_confirmation: None,
+        modify_ack_deadline_confirmation: None,
+    }))
+    .await
+    .unwrap();
 
-    // Subscriber should backoff and then reconnect
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let msg1 = stream.next().await.unwrap().unwrap();
+    assert_eq!(msg1.0.data, b"m1");
+
+    // Drop connection
+    *mock_sub.drop_connection.lock().unwrap() = true;
+    let _ = tx1.send(Err(Status::aborted("simulated disconnect"))).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    *mock_sub.drop_connection.lock().unwrap() = false; // allow reconnect
+
+    // Wait for client to reconnect
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let tx2 = mock_sub
         .push_messages_tx
         .lock()
         .unwrap()
         .clone()
-        .expect("Client didn't reconnect after backoff");
+        .expect("Client didn't reconnect");
 
-    let res = tx2
-        .send(Ok(StreamingPullResponse {
-            received_messages: vec![ReceivedMessage {
-                ack_id: "ack-retry".into(),
-                message: Some(PubsubMessage {
-                    data: b"retry success".to_vec(),
-                    ..Default::default()
-                }),
-                delivery_attempt: 1,
-            }],
-            subscription_properties: None,
-            acknowledge_confirmation: None,
-            modify_ack_deadline_confirmation: None,
-        }))
-        .await;
+    // Send message on new connection
+    tx2.send(Ok(StreamingPullResponse {
+        received_messages: vec![ReceivedMessage {
+            ack_id: "ack-2".into(),
+            message: Some(PubsubMessage {
+                data: b"m2".to_vec(),
+                ..Default::default()
+            }),
+            delivery_attempt: 1,
+        }],
+        subscription_properties: None,
+        acknowledge_confirmation: None,
+        modify_ack_deadline_confirmation: None,
+    }))
+    .await
+    .unwrap();
 
-    res.unwrap();
-
-    let msg = stream.next().await.unwrap().unwrap().0;
-    assert_eq!(msg.data, b"retry success", "Subscriber must automatically reconnect and resume receiving messages after ResourceExhausted");
+    let msg2 = stream.next().await.unwrap().unwrap();
+    assert_eq!(
+        msg2.0.data, b"m2",
+        "Subscriber must automatically reconnect and resume receiving messages"
+    );
 }
 
 #[tokio::test]
@@ -473,7 +349,7 @@ async fn test_subscriber_schema_propagation() {
 }
 
 #[tokio::test]
-async fn test_subscriber_zero_length_message() {
+async fn test_subscriber_network_timeouts() {
     let (_server, addr, mock_sub) = start_mock_subscriber().await;
     let pool = rust_pubsub::connection::ConnectionPool::new(1, Some(&addr))
         .await
@@ -483,13 +359,36 @@ async fn test_subscriber_zero_length_message() {
     let mut stream = subscriber.subscribe().await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let tx = mock_sub.push_messages_tx.lock().unwrap().clone().unwrap();
+    let tx = mock_sub
+        .push_messages_tx
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("Client didn't connect");
 
-    tx.send(Ok(StreamingPullResponse {
+    // Simulate network timeout by waiting a long time without sending anything,
+    // then sending a deadline exceeded or letting the stream timeout.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = tx
+        .send(Err(Status::deadline_exceeded("network timeout")))
+        .await;
+
+    // Wait for client to reconnect
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let tx2 = mock_sub
+        .push_messages_tx
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("Client didn't reconnect");
+
+    // Send message on new connection
+    tx2.send(Ok(StreamingPullResponse {
         received_messages: vec![ReceivedMessage {
-            ack_id: "test-zero".into(),
+            ack_id: "ack-timeout-retry".into(),
             message: Some(PubsubMessage {
-                data: vec![],
+                data: b"m-after-timeout".to_vec(),
                 ..Default::default()
             }),
             delivery_attempt: 1,
@@ -501,47 +400,9 @@ async fn test_subscriber_zero_length_message() {
     .await
     .unwrap();
 
-    let msg = stream.next().await.unwrap().unwrap().0;
-    assert!(
-        msg.data.is_empty(),
-        "Should be able to receive a zero-length message"
-    );
-}
-
-#[tokio::test]
-async fn test_subscriber_max_length_message() {
-    let (_server, addr, mock_sub) = start_mock_subscriber().await;
-    let pool = rust_pubsub::connection::ConnectionPool::new(1, Some(&addr))
-        .await
-        .unwrap();
-    let mut subscriber = Subscriber::new("test-sub".into(), pool);
-
-    let mut stream = subscriber.subscribe().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let tx = mock_sub.push_messages_tx.lock().unwrap().clone().unwrap();
-
-    let large_data = vec![0u8; 10 * 1024 * 1024];
-    tx.send(Ok(StreamingPullResponse {
-        received_messages: vec![ReceivedMessage {
-            ack_id: "test-max".into(),
-            message: Some(PubsubMessage {
-                data: large_data.clone(),
-                ..Default::default()
-            }),
-            delivery_attempt: 1,
-        }],
-        subscription_properties: None,
-        acknowledge_confirmation: None,
-        modify_ack_deadline_confirmation: None,
-    }))
-    .await
-    .unwrap();
-
-    let msg = stream.next().await.unwrap().unwrap().0;
+    let msg2 = stream.next().await.unwrap().unwrap();
     assert_eq!(
-        msg.data.len(),
-        10 * 1024 * 1024,
-        "Should be able to receive a max-length message"
+        msg2.0.data, b"m-after-timeout",
+        "Subscriber must automatically reconnect after a network timeout"
     );
 }

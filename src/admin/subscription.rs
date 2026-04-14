@@ -23,14 +23,18 @@ impl SubscriptionAdminClient {
 
     pub async fn get_subscription(&self, subscription: impl Into<String>) -> Result<Subscription> {
         let mut client = self.client.clone();
-        let request = GetSubscriptionRequest { subscription: subscription.into() };
+        let request = GetSubscriptionRequest {
+            subscription: subscription.into(),
+        };
         let response = client.get_subscription(request).await?;
         Ok(response.into_inner())
     }
 
     pub async fn delete_subscription(&self, subscription: impl Into<String>) -> Result<()> {
         let mut client = self.client.clone();
-        let request = DeleteSubscriptionRequest { subscription: subscription.into() };
+        let request = DeleteSubscriptionRequest {
+            subscription: subscription.into(),
+        };
         client.delete_subscription(request).await?;
         Ok(())
     }
@@ -51,11 +55,11 @@ impl SubscriptionAdminClient {
                     page_token: page_token.clone(),
                 };
                 let response = client.list_subscriptions(request).await.map_err(Error::Grpc)?.into_inner();
-                
+
                 for sub in response.subscriptions {
                     yield sub;
                 }
-                
+
                 page_token = response.next_page_token;
                 if page_token.is_empty() {
                     break;
